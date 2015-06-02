@@ -1,69 +1,98 @@
 import argparse
-import datetime
+import sqlite3
+import hashlib
 import zipfile
 import filecmp
 import shutil
-import sys
+import time
+import re
 import os
 
+ARCHIVE_NAME_REGEX = "[a-fA-F0-9]{40}"
+BACKUP_FILE_LENGTH = 40
+
 REPO = os.path.expanduser("~/.cptool")
+TAGS = os.path.join(REPO, ".cptags")
 BACKUP = ".cpbackup"
 SYNC = ".cpsync"
-
-DATETIME_FORMAT = "%a_%b_%d_%Y_%H_%M_%S_%f"
-SEPARATOR = "_on_"
-
-
-# Helpers
-
-
-def check_dir(directory, message=None):
-    if not os.path.isdir(directory):
-        if message is None:
-            message = "Directory '%s' does not exist." % directory
-        raise CpException(message)
-
-
-def encode_dir_name(directory):
-    path = directory.replace(os.path.sep, '_')
-    when = datetime.datetime.now().strftime(DATETIME_FORMAT)
-    return path + SEPARATOR + when
-
-
-def decode_dir_name(name):
-    base = os.path.splitext(name)[0]
-    path, when = base.split(SEPARATOR)
-    path = path.replace("_", os.path.sep)
-    when = datetime.datetime.strptime(when, DATETIME_FORMAT)
-    return path, when
-
-
-def read(prompt=None, converter=None):
-    if prompt is not None:
-        sys.stdout.write(prompt)
-    user_input = sys.stdin.read(1)
-    return user_input if converter is None else converter(user_input)
 
 
 class CpException(Exception):
     pass
 
 
-# Backup & revert
+def ensure_dir_exists(directory, message=None):
+    if not os.path.isdir(directory):
+        if message is None:
+            message = "Directory '%s' does not exist." % directory
+        raise CpException(message)
 
 
-def backup(directory):
+INSERT_TAG = "INSERT OR REPLACE INTO tags VALUES (?,?,?)"
+GET_TAG = "SELECT dir,zip FROM tags WHERE tag=?"
+CREATE_TAGS_TABLE = """
+CREATE TABLE IF NOT EXISTS tags (
+    tag TEXT PRIMARY KEY,
+    dir TEXT,
+    zip TEXT
+)
+"""
+
+
+def set_tag(directory, archive_path, tag):
+    assert tag and os.path.isdir(directory) and os.path.isfile(archive_path)
+    with sqlite3.connect(TAGS) as db:
+        cursor = db.cursor()
+        cursor.execute(CREATE_TAGS_TABLE)
+        cursor.execute(INSERT_TAG, (tag, directory, archive_path))
+        db.commit()
+
+
+def revert_by_tag(tag):
+    assert tag
+    with sqlite3.connect(TAGS) as db:
+        cursor = db.cursor()
+        cursor.execute(GET_TAG, (tag,))
+        result = cursor.fetchone()
+    if not result:
+        raise CpException("Tag '%s' does not exist." % tag)
+    directory, archive_path = result
+    revert(directory, archive_path)
+
+
+GET_DIR = "SELECT tag,zip FROM tags WHERE dir=?"
+
+
+def show_tag_history(directory):
+    with sqlite3.connect(TAGS) as db:
+        cursor = db.cursor()
+        cursor.execute(GET_DIR, (directory,))
+        result = cursor.fetchall()
+    if not result:
+        raise CpException("Directory '%s' has no backup history." % directory)
+    for item in result:
+        tag, archive_path = item
+        if os.path.isfile(archive_path):
+            created = os.path.getctime(archive_path)
+            print "TAG=%s, CREATED=%s" % (tag, time.ctime(created))
+
+
+def backup(directory, tag=None):
+    ensure_dir_exists(directory)
     if not os.path.isdir(REPO):
         os.makedirs(REPO)
     assert os.path.isdir(REPO)
-    name = encode_dir_name(directory)
-    archive_path = os.path.join(REPO, name)
+    key = str(time.time())
+    sha = hashlib.sha1(key).hexdigest()
+    archive_path = os.path.join(REPO, sha)
     assert not os.path.isfile(archive_path)
     shutil.make_archive(archive_path, "zip", directory)
     backup_path = os.path.join(directory, BACKUP)
     with open(backup_path, 'w') as b:
-        b.write(name)
-    assert os.path.getsize(backup_path) == len(name)
+        b.write(sha)
+    assert os.path.getsize(backup_path) == BACKUP_FILE_LENGTH
+    if tag:
+        set_tag(directory, archive_path + ".zip", tag)
 
 
 def get_archive_name(directory):
@@ -73,59 +102,39 @@ def get_archive_name(directory):
         raise CpException("Backup file missing in '%s'." % directory)
     with open(backup_path) as b:
         archive_name = b.readline()
-        assert archive_name
-        return archive_name + ".zip"
+    if not re.compile(ARCHIVE_NAME_REGEX).match(archive_name):
+        raise CpException("Backup file in '%s' corrupted." % directory)
+    return archive_name + ".zip"
 
 
-def revert(directory, archive_name=None):
-    check_dir(directory)
-    if archive_name is None:
+def revert(directory, archive_path=None):
+    ensure_dir_exists(directory)
+    if archive_path is None:
         archive_name = get_archive_name(directory)
-    assert archive_name
-    archive_path = os.path.join(REPO, archive_name)
+        archive_path = os.path.join(REPO, archive_name)
     if not os.path.isfile(archive_path):
-        raise CpException("Archive '%s' unavailable." % archive_path)
+        raise CpException("Archive '%s' missing." % archive_path)
     shutil.rmtree(directory)
     with zipfile.ZipFile(archive_path) as zf:
         zf.extractall(directory)
 
 
-def backup_history(directory):
-    check_dir(directory)
-    history = []
-    try:
-        archive_name = get_archive_name(directory)
-    except CpException:
-        return history
-    has_history = True
-    while has_history:
-        archive_path = os.path.join(REPO, archive_name)
-        history.append((archive_path, os.path.getctime(archive_path)))
-        with zipfile.ZipFile(archive_path) as zf:
-            if BACKUP in zf.namelist():
-                archive_name = zf.read(BACKUP) + ".zip"
-            else:
-                has_history = False
-    return history
-
-
-# Diffs
-
-
 def find_diff(src, dst):
     if os.path.isdir(dst):
         diff = filecmp.dircmp(src, dst)
-        return diff.left_only + diff.diff_files
+        diff_list = diff.left_only + diff.diff_files
     else:
-        return [f for f in os.listdir(src)]
+        diff_list = [f for f in os.listdir(src)]
+    ignore = (BACKUP, SYNC)
+    return filter(lambda l: l not in ignore, diff_list)
 
 
-def apply_diff(src, dst, diff_list=None, auto_backup=True):
+def apply_diff(src, dst, diff_list=None, auto_backup=True, backup_tag=None):
     if diff_list is None:
         diff_list = find_diff(src, dst)
     if diff_list:
         if auto_backup:
-            backup(dst)
+            backup(dst, backup_tag)
         for item in diff_list:
             src_item = os.path.join(src, item)
             dst_item = os.path.join(dst, item)
@@ -135,48 +144,8 @@ def apply_diff(src, dst, diff_list=None, auto_backup=True):
                 shutil.copy(src_item, dst_item)
 
 
-# User interaction
-
-
-def exec_diff(src, dst):
-    diff_list = find_diff(src, dst)
-    if diff_list:
-        print "\n".join(diff_list)
-        sys.stdout.write("\nCopy all (y/n)? ")
-        confirm = sys.stdin.read(1)
-        if "y" == confirm.lower():
-            apply_diff(src, dst, diff_list)
-        else:
-            print "Nothing copied."
-    else:
-        print "No changes found."
-
-
-def manual_revert():
-    check_dir(REPO, "Backup repository does not exist.")
-    backup_list = filter(lambda f: f.endswith(".zip"), os.listdir(REPO))
-    if not backup_list:
-        raise CpException("Backup repository is empty.")
-    print "Manual reverts available for:\n"
-    for index, item in enumerate(backup_list):
-        path, when = decode_dir_name(item)
-        print "%d: %s, backed on %s" % (index, path, when)
-    index = read("\nSelect backup index to apply: ", int)
-    if 0 <= index < len(backup_list):
-        archive_path = backup_list[index]
-        path, unused_when = decode_dir_name(archive_path)
-        revert(path, archive_path)
-    else:
-        raise CpException("Invalid selection")
-
-
-# Sync
-
-
 def generate_sync_file(directory, sources):
-    assert os.path.isdir(directory) and len(sources) > 0
-    for source in sources:
-        check_dir(source, "Invalid source dir: '%s'." % source)
+    ensure_dir_exists(directory)
     absolute_paths = [os.path.abspath(s) for s in sources]
     sync_file = os.path.join(directory, SYNC)
     with open(sync_file, "w") as cp:
@@ -184,7 +153,8 @@ def generate_sync_file(directory, sources):
     assert os.path.getsize(sync_file) > 0
 
 
-def sync(directory):
+def sync(directory, backup_tag=None):
+    ensure_dir_exists(directory)
     sync_path = os.path.join(directory, SYNC)
     if not os.path.isfile(sync_path):
         raise CpException("Sync file for '%s' missing." % directory)
@@ -193,13 +163,10 @@ def sync(directory):
     if not src_list:
         raise CpException("Sync file is empty.")
     for src in src_list:
-        check_dir(src, "Invalid source dir: '%s'." % src)
-    backup(directory)
+        ensure_dir_exists(src, "Invalid source dir: '%s'." % src)
+    backup(directory, backup_tag)
     for src in src_list:
-        apply_diff(src, directory, auto_backup=False)
-
-
-# CLI
+        apply_diff(src, directory, auto_backup=False, backup_tag=backup_tag)
 
 
 class ValidDirAction(argparse.Action):
@@ -215,18 +182,21 @@ def diff_parser():
     parser = argparse.ArgumentParser(
         description="Compare and copy missing files from one dir to another"
     )
-    subparsers = parser.add_subparsers(title="Options", dest="opt")
 
-    cp = subparsers.add_parser("cp", help="Copy from one dir to another")
+    subparsers = parser.add_subparsers(title="Options", dest="opt")
+    tag_parser = argparse.ArgumentParser(add_help=False)
+    tag_parser.add_argument("-t", "--tag", help="Backup tag")
+
+    cp = subparsers.add_parser("cp", help="Copy from one dir to another",
+                               parents=[tag_parser])
     cp.add_argument("src", help="source dir", action=ValidDirAction)
     cp.add_argument("dst", help="destination dir", action=ValidDirAction)
 
     rv = subparsers.add_parser("rv", help="Revert")
-    rv.add_argument("dir", help="dir to revert", action=ValidDirAction)
+    rv.add_argument("-d", "--dir", help="dir to revert", action=ValidDirAction)
+    rv.add_argument("-t", "--tag", help="tag to revert")
 
-    subparsers.add_parser("manrv", help="Manual revert")
-
-    sync = subparsers.add_parser("sync", help="Auto-sync")
+    sync = subparsers.add_parser("sync", help="Auto-sync", parents=[tag_parser])
     sync.add_argument("dir", help="dir to sync", action=ValidDirAction)
 
     mksync = subparsers.add_parser("mksync", help="Generate auto-sync folder")
@@ -234,19 +204,31 @@ def diff_parser():
     mksync.add_argument("src", nargs='+', help="source dirs",
                         action=ValidDirAction)
 
+    history = subparsers.add_parser("th", help="Tag history")
+    history.add_argument("dir", help="dir to check", action=ValidDirAction)
+
     return parser
 
 
-if __name__ == '__main__':
-    h = backup_history("/Users/tslamic/Documents/Development/c")
-    for path, when in h:
-        print "%s : %s" % (path, datetime.datetime.fromtimestamp(when))
+def invoke_revert(directory=None, tag=None):
+    if not (directory or tag):
+        raise CpException("rv: either directory or tag has to be provided.")
+    if directory:
+        revert(directory)
+    else:
+        revert_by_tag(tag)
 
-        # args = diff_parser().parse_args()
-        # {
-        #     "cp": lambda: exec_diff(args.src, args.dst),
-        #     "rv": lambda: revert(args.dir),
-        #     "manrv": lambda: manual_revert(),
-        #     "sync": lambda: sync(args.dir),
-        #     "mksync": lambda: generate_sync_file(args.dir, args.src),
-        # }[args.opt]()
+
+if __name__ == '__main__':
+    args = diff_parser().parse_args()
+    opts = {
+        "cp": lambda: apply_diff(args.src, args.dst, backup_tag=args.tag),
+        "rv": lambda: invoke_revert(args.dir, args.tag),
+        "th": lambda: show_tag_history(args.dir),
+        "sync": lambda: sync(args.dir, args.tag),
+        "mksync": lambda: generate_sync_file(args.dir, args.src),
+    }
+    try:
+        opts[args.opt]()
+    except CpException as e:
+        print str(e)
